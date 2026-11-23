@@ -10,7 +10,7 @@ One OAuth-protected MCP endpoint on your PC that fronts all your MCP servers (te
 ## Install
 
 ```bash
-git clone https://github.com/<you>/mcp-gateway && cd mcp-gateway
+git clone https://github.com/harshp2008/mcp-gateway && cd mcp-gateway
 ./install.sh                      # name = this PC's hostname
 ./install.sh --name main-laptop   # or pick one
 ```
