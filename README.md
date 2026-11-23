@@ -65,7 +65,7 @@ claude mcp add --transport http mcp-main-laptop http://127.0.0.1:8765/mcp --head
 ### Gemini web (or any web app / phone)
 Web apps need a public HTTPS URL. `mcp-gateway funnel` does all of this for you (needs Tailscale installed and logged in: `curl -fsSL https://tailscale.com/install.sh | sh && sudo tailscale up`; if it complains, enable MagicDNS + HTTPS + Funnel in the Tailscale admin console - it prints the link). Every PC gets its own `<hostname>.<tailnet>.ts.net` name, so two laptops never clash, whether or not they share a Tailscale account. The manual equivalent: With Tailscale Funnel (only expose the MCP paths, on a non-443 port so you don't expose other things):
 ```bash
-for p in /mcp /token /register /authorize /.well-known; do
+for p in /mcp /token /register /authorize /.well-known /icon.png /favicon.ico; do
   tailscale funnel --bg --https=10000 --set-path=$p http://127.0.0.1:8765$p
 done
 mcp-gateway url https://<machine>.<tailnet>.ts.net:10000

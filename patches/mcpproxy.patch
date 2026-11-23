@@ -794,8 +794,115 @@ index 0000000..9fb27ec
 +		return ok, nil
 +	}
 +}
+diff --git a/cmd/mcpproxyd/icon.go b/cmd/mcpproxyd/icon.go
+new file mode 100644
+index 0000000..c3e3dc4
+--- /dev/null
++++ b/cmd/mcpproxyd/icon.go
+@@ -0,0 +1,101 @@
++package main
++
++import (
++	"bytes"
++	"hash/fnv"
++	"image"
++	"image/color"
++	"image/png"
++	"math"
++	"net/http"
++	"os"
++	"sync"
++)
++
++// Local patch: a tiny laptop icon whose colour is derived from MCP_SERVER_NAME,
++// so each PC's connector looks different in apps that show an icon (e.g. Gemini).
++// Served unauthenticated at /icon.png and /favicon.ico (icons are not sensitive).
++
++var (
++	iconOnce sync.Once
++	iconData []byte
++)
++
++func hsvToRGB(h, s, v float64) color.RGBA {
++	c := v * s
++	x := c * (1 - math.Abs(math.Mod(h/60, 2)-1))
++	m := v - c
++	var r, g, b float64
++	switch {
++	case h < 60:
++		r, g, b = c, x, 0
++	case h < 120:
++		r, g, b = x, c, 0
++	case h < 180:
++		r, g, b = 0, c, x
++	case h < 240:
++		r, g, b = 0, x, c
++	case h < 300:
++		r, g, b = x, 0, c
++	default:
++		r, g, b = c, 0, x
++	}
++	return color.RGBA{uint8((r + m) * 255), uint8((g + m) * 255), uint8((b + m) * 255), 255}
++}
++
++func buildIcon() []byte {
++	name := os.Getenv("MCP_SERVER_NAME")
++	if name == "" {
++		name = "mcp"
++	}
++	hh := fnv.New32a()
++	_, _ = hh.Write([]byte(name))
++	bg := hsvToRGB(float64(hh.Sum32()%360), 0.65, 0.85)
++	white := color.RGBA{255, 255, 255, 255}
++	const n = 128
++	img := image.NewRGBA(image.Rect(0, 0, n, n))
++	rect := func(x0, y0, x1, y1 int, c color.RGBA) {
++		for y := y0; y < y1; y++ {
++			for x := x0; x < x1; x++ {
++				img.SetRGBA(x, y, c)
++			}
++		}
++	}
++	// rounded-square background (radius 24)
++	const rad = 24.0
++	for y := 0; y < n; y++ {
++		for x := 0; x < n; x++ {
++			dx, dy := 0.0, 0.0
++			if float64(x) < rad {
++				dx = rad - float64(x)
++			} else if float64(x) > n-1-rad {
++				dx = float64(x) - (n - 1 - rad)
++			}
++			if float64(y) < rad {
++				dy = rad - float64(y)
++			} else if float64(y) > n-1-rad {
++				dy = float64(y) - (n - 1 - rad)
++			}
++			if dx*dx+dy*dy <= rad*rad {
++				img.SetRGBA(x, y, bg)
++			}
++		}
++	}
++	rect(30, 32, 98, 82, white) // lid
++	rect(36, 38, 92, 76, bg)    // screen
++	rect(18, 88, 110, 98, white) // base
++	var buf bytes.Buffer
++	_ = png.Encode(&buf, img)
++	return buf.Bytes()
++}
++
++func registerIcon(mux *http.ServeMux) {
++	h := func(w http.ResponseWriter, _ *http.Request) {
++		iconOnce.Do(func() { iconData = buildIcon() })
++		w.Header().Set("Content-Type", "image/png")
++		w.Header().Set("Cache-Control", "public, max-age=3600")
++		_, _ = w.Write(iconData)
++	}
++	mux.HandleFunc("/icon.png", h)
++	mux.HandleFunc("/favicon.ico", h)
++}
 diff --git a/cmd/mcpproxyd/main.go b/cmd/mcpproxyd/main.go
-index 75f897e..0fd9a41 100644
+index 75f897e..1e8b740 100644
 --- a/cmd/mcpproxyd/main.go
 +++ b/cmd/mcpproxyd/main.go
 @@ -9,6 +9,7 @@ package main
@@ -816,7 +923,15 @@ index 75f897e..0fd9a41 100644
  	hooks := inspect.Hooks{} // standalone: guardrails/redaction via future plugins
  	pipeline := checks.Assemble(cfg.Policy, hooks, sink, true)
  	if cfg.Optimizer != nil && cfg.Optimizer.TopK > 0 {
-@@ -173,6 +177,11 @@ func run(cfgPath string, log *slog.Logger) error {
+@@ -158,6 +162,7 @@ func run(cfgPath string, log *slog.Logger) error {
+ 	// ---- HTTP mux -----------------------------------------------------------
+ 	mux := http.NewServeMux()
+ 	mux.Handle("/mcp", gw.Handler())
++	registerIcon(mux)
+ 	mux.Handle("/approvals/", http.StripPrefix("/approvals",
+ 		approval.NewAPI(heldStore, cfg.Approvals.APIToken)))
+ 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+@@ -173,6 +178,11 @@ func run(cfgPath string, log *slog.Logger) error {
  		mux.Handle("/token", authSrv.Routes())
  		mux.Handle("/register", authSrv.Routes())
  		mux.Handle("/callback", authSrv.Routes())
@@ -828,7 +943,7 @@ index 75f897e..0fd9a41 100644
  	} else if cfg.Inbound.Mode == "oidc" {
  		// Serve RFC 9728 protected-resource metadata pointing at the
  		// external issuer, so MCP clients can discover where to
-@@ -209,11 +218,25 @@ func run(cfgPath string, log *slog.Logger) error {
+@@ -209,11 +219,25 @@ func run(cfgPath string, log *slog.Logger) error {
  // own tokens; otherwise the configured inbound mode decides.
  func buildResolver(cfg *config.Config, authSrv *authserver.Server) (gateway.IdentityResolver, error) {
  	if authSrv != nil {
@@ -918,7 +1033,7 @@ index 421ef69..956ae7c 100644
  	}
  	if c.Approvals.Timeout == 0 {
 diff --git a/gateway/conn.go b/gateway/conn.go
-index 3287427..0df5290 100644
+index 3287427..a39f299 100644
 --- a/gateway/conn.go
 +++ b/gateway/conn.go
 @@ -1,6 +1,7 @@
@@ -929,7 +1044,7 @@ index 3287427..0df5290 100644
  	"context"
  	"encoding/json"
  	"fmt"
-@@ -451,7 +452,15 @@ func (c *conn) fanoutInitialize(ctx context.Context, env *jsonrpc.Message) (*jso
+@@ -451,7 +452,18 @@ func (c *conn) fanoutInitialize(ctx context.Context, env *jsonrpc.Message) (*jso
  	if c.g.aggregated() && first != nil {
  		var res mcp.InitializeResult
  		if err := json.Unmarshal(first.Result, &res); err == nil {
@@ -939,6 +1054,9 @@ index 3287427..0df5290 100644
 +				name = n
 +			}
 +			res.ServerInfo = mcp.Implementation{Name: name, Version: "0.1.0"}
++			if pub := os.Getenv("MCP_PUBLIC_URL"); pub != "" {
++				res.ServerInfo.Icons = []mcp.Icon{{Src: strings.TrimRight(pub, "/") + "/icon.png", MimeType: "image/png", Sizes: []string{"128x128"}}}
++			}
 +			if lbl := os.Getenv("MCP_LABEL"); lbl != "" {
 +				res.Instructions = "This gateway controls ONE specific computer: " + lbl +
 +					". Every tool here runs on " + lbl + " and nowhere else. If the user asked for a different computer, do not use these tools."
@@ -1019,3 +1137,25 @@ index cab3417..e515199 100644
 +	st.Approve()
 +	return nil, nil
 +}
+diff --git a/mcp/mcp.go b/mcp/mcp.go
+index c30e5f5..aadadbf 100644
+--- a/mcp/mcp.go
++++ b/mcp/mcp.go
+@@ -38,9 +38,17 @@ type InitializeResult struct {
+ }
+ 
+ // Implementation identifies a client or server.
++// Icon is an MCP 2025-11 server/tool icon (local patch).
++type Icon struct {
++	Src      string   `json:"src"`
++	MimeType string   `json:"mimeType,omitempty"`
++	Sizes    []string `json:"sizes,omitempty"`
++}
++
+ type Implementation struct {
+ 	Name    string `json:"name"`
+ 	Version string `json:"version"`
++	Icons   []Icon `json:"icons,omitempty"`
+ }
+ 
+ // Tool is a tool descriptor from tools/list (subset; extra fields preserved

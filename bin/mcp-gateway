@@ -390,7 +390,7 @@ def cmd_desktop(args):
 
 # ---------------------------------------------------------------- Tailscale Funnel
 FUNNEL_PORT = 10000
-FUNNEL_PATHS = ["/mcp", "/token", "/register", "/authorize", "/.well-known"]
+FUNNEL_PATHS = ["/mcp", "/token", "/register", "/authorize", "/.well-known", "/icon.png", "/favicon.ico"]
 
 
 def cmd_funnel(args):
