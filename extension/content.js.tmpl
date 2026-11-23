@@ -31,22 +31,24 @@
       if (el.children.length > 1) continue;
       const btn = clickable(el);
       if (handled.has(btn)) continue;
-      let card = parentOf(btn), found = false;
+      // climb to the card: it must contain "Let Gemini use" AND the connector name,
+      // but stay small (< 600 chars) so we never match the whole chat.
+      let card = parentOf(btn), found = false, ok = false;
       for (let i = 0; i < 20 && card; i++, card = parentOf(card)) {
         const t = card.textContent || "";
+        if (t.length > 600) break;
         if (t.includes("Let Gemini use")) {
           found = true;
-          if (norm(t).includes(APP)) {
-            handled.add(btn);
-            log("card for", APP, "->", btn.tagName);
-            setTimeout(() => tryClick(btn), 200);
-          } else if (!handled.has(card)) {
-            handled.add(card);
-            log("card is for a different connector, ignoring");
-          }
-          break;
+          if (norm(t).includes(APP)) { ok = true; break; }
         }
       }
+      if (ok) {
+        handled.add(btn);
+        log("card for", APP, "->", btn.tagName);
+        setTimeout(() => tryClick(btn), 200);
+        continue;
+      }
+      if (found && !handled.has(btn)) { handled.add(btn); log("card is for a different connector, ignoring"); continue; }
       if (!found && !handled.has(btn)) { handled.add(btn); log('saw "Allow once" but no "Let Gemini use" ancestor', btn.tagName); }
     }
   }
