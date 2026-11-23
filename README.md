@@ -70,14 +70,15 @@ mcp-gateway url https://<machine>.<tailnet>.ts.net:10000
 Gemini → Settings → connectors → add custom MCP connector: name `mcp-main-laptop`, URL `https://<machine>.<tailnet>.ts.net:10000/mcp`, auth OAuth. A popup appears **on the PC**: "Approve & trust". In chats, @mention the connector.
 
 #### Optional: stop Gemini's per-call "Allow" cards
-Gemini asks permission on every tool call and that can't be disabled server-side. `install.sh` generates a small Chrome extension in `~/.mcp-gateway/extension` that clicks "Allow once" for **this PC's connector only**:
+Gemini asks permission on every tool call and that can't be disabled server-side. The repo ships a small Chrome extension (`extension/`) that clicks **Allow once** for every connector named `mcp-*`, so one install in your browser covers all your PCs (`mcp-main-laptop`, `mcp-old-laptop`, ...):
 ```bash
-mcp-gateway extension    # (re)writes it and prints the steps
+mcp-gateway extension                       # writes ~/.mcp-gateway/extension and prints the steps
+mcp-gateway extension --only mcp-main-laptop   # restrict to specific connectors
 ```
-Then Chrome -> `chrome://extensions` -> Developer mode -> **Load unpacked** -> pick `~/.mcp-gateway/extension` -> reload Gemini. Re-run it after renaming the PC. Dangerous shell commands are still blocked by dcg.
+Chrome -> `chrome://extensions` -> Developer mode -> **Load unpacked** -> pick the folder -> reload Gemini. On a machine without a gateway, just clone this repo and load its `extension/` folder. Dangerous shell commands are still blocked by dcg on each gateway.
 
 ### Two (or more) PCs
-Run `./install.sh --name old-laptop` on each, give each its own Funnel URL, add one connector per PC (`@mcp-main-laptop`, `@mcp-old-laptop`). The name appears in the server name and in tool instructions ("you are running on OLD-LAPTOP").
+Run `./install.sh --name old-laptop` on each, give each its own Funnel URL, add one connector per PC (`@mcp-main-laptop`, `@mcp-old-laptop`). Connectors live in your Google account, so any browser/laptop signed into Gemini can drive any of your PCs - nothing needs installing on the PC you're typing from. The name appears in the server name and in tool instructions ("you are running on OLD-LAPTOP").
 
 ### Revoke
 ```bash

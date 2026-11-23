@@ -7,7 +7,7 @@
   mcp-gateway client add NAME      per-client static token (Claude Code, scripts)
   mcp-gateway trust list|revoke SUBJECT|add SUBJECT [DAYS]
   mcp-gateway connect [claude-desktop|claude-code|gemini|other]
-  mcp-gateway extension           write the Gemini auto-allow Chrome extension + install steps
+  mcp-gateway extension [--only NAME..]  Gemini auto-allow Chrome extension (all mcp-* connectors) + install steps
   mcp-gateway status | restart | logs | render
 """
 import json, os, re, secrets, socket, subprocess, sys, shutil, datetime
@@ -139,8 +139,6 @@ def cmd_name(a):
     if a:
         s["name"] = slug(" ".join(a))
         save(s); render(); restart()
-        if os.path.isdir(f"{HOME}/extension"):
-            make_ext(quiet=True)
     print(f"this PC: {machine_name(s)}  (connector/server name: mcp-{machine_name(s)})"
           + ("" if s.get("name") else "   [default = hostname]"))
     if a:
@@ -218,29 +216,38 @@ def cmd_trust(a):
     print("ok")
 
 
-def make_ext(quiet=False):
+def make_ext(args=(), quiet=False):
     src = f"{HOME}/app/extension"
     dst = f"{HOME}/extension"
     if not os.path.isdir(src):
-        die("extension templates missing; re-run install.sh")
+        die("extension files missing; re-run install.sh")
+    only = []
+    args = list(args)
+    if args and args[0] == "--only":
+        only = args[1:]
+        if not only:
+            die("extension --only NAME [NAME...]   e.g. --only mcp-main-laptop")
+    prefixes = [re.sub(r"[-_\s]+", " ", n.lower()).strip() + ("" if only else " ") for n in only] or ["mcp "]
     os.makedirs(dst, exist_ok=True)
-    n = machine_name(load())
-    for f in ("manifest.json", "content.js"):
-        open(f"{dst}/{f}", "w").write(open(f"{src}/{f}.tmpl").read().replace("@NAME@", n))
+    shutil.copy(f"{src}/manifest.json", f"{dst}/manifest.json")
+    js = open(f"{src}/content.js").read()
+    js = re.sub(r'const ALLOW = \[.*?\];', "const ALLOW = " + json.dumps(prefixes) + ";", js, count=1)
+    open(f"{dst}/content.js", "w").write(js)
     if quiet:
         return
+    what = ("only: " + ", ".join(only)) if only else "every connector named mcp-* (all your PCs)"
     print(f"""Chrome extension written to: {dst}
-It auto-clicks Gemini's "Allow" card, ONLY for the connector named mcp-{n}.
+Auto-clicks Gemini's "Allow once" card for {what}.
 
-Install (Chrome / Chromium / Edge / Brave):
+Install (Chrome / Chromium / Edge / Brave) - once per browser, covers ALL your gateway PCs:
   1. open chrome://extensions
   2. turn on "Developer mode" (top right)
   3. click "Load unpacked" and pick: {dst}
   4. reload gemini.google.com
-  Test: ask Gemini to use @mcp-{n}; the Allow card should click itself.
-  (DevTools console shows "[gw-autoallow] active".) After `mcp-gateway name`, run
-  `mcp-gateway extension` again and hit the reload icon on the extension.
-Safety: dangerous shell commands are still blocked by dcg on the gateway; remove the extension to get cards back.""")
+  Test: ask Gemini to use @mcp-{machine_name(load())}; the card should click itself
+  (DevTools console shows "[gw-autoallow] active").
+It is the same extension for every PC. On a laptop without a gateway just clone the repo and load its extension/ folder.
+Safety: dangerous shell commands are still blocked by dcg on each gateway; remove the extension to get the cards back.""")
 
 
 def cmd_status(_):
@@ -290,7 +297,7 @@ def main():
         print(__doc__); return
     c, rest = a[0], a[1:]
     table = {"name": cmd_name, "url": cmd_url, "backend": cmd_backend, "client": cmd_client, "trust": cmd_trust,
-             "connect": cmd_connect, "status": cmd_status, "extension": lambda _: make_ext()}
+             "connect": cmd_connect, "status": cmd_status, "extension": lambda r: make_ext(r)}
     if c in table:
         table[c](rest)
     elif c == "render":
