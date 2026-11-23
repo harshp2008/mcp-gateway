@@ -37,6 +37,7 @@ mcp-gateway backend list
 | `mcp-gateway client add NAME` | static token for scripts / Claude Code |
 | `mcp-gateway trust list\|revoke SUBJECT\|add SUBJECT [DAYS]` | who is trusted |
 | `mcp-gateway connect [claude-desktop\|claude-code\|gemini\|other]` | copy-paste linking steps with your name/URL filled in |
+| `mcp-gateway uninstall [--dry-run] [--yes] [--keep-data] [--keep-desktop]` | remove everything the installer set up (also `./install.sh --uninstall`) |
 | `mcp-gateway status \| restart \| logs` | ops |
 
 ## Link it to your apps
@@ -88,6 +89,13 @@ Run `./install.sh --name old-laptop` on each, give each its own Funnel URL, add 
 mcp-gateway trust list
 mcp-gateway trust revoke oauth:<client_id>     # or client:<name>
 ```
+
+## Uninstall
+```bash
+mcp-gateway uninstall --dry-run   # shows exactly what would happen
+mcp-gateway uninstall
+```
+Stops and removes the services, turns off only this gateway's Funnel paths, removes its entry from Claude Desktop (and puts back servers that were moved aside; asks before closing Desktop), and deletes `~/.mcp-gateway`. It leaves Tailscale, open-terminal, Go and the cloned repo alone. Afterwards delete the connector in Gemini and the Chrome extension.
 
 ## Security notes
 - Trusted client ⇒ full access to every backend (incl. the terminal). The popup is the gate; only approve what *you* just started. Keep the Funnel path-restricted.

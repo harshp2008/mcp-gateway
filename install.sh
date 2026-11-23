@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Installs the MCP gateway for the current user (no root needed).
+#   ./install.sh --uninstall [--dry-run] [--yes] [--keep-data]   (removes everything)
 #   ./install.sh [--name NAME] [--yes] [--no-desktop] [--no-funnel] [--no-open-terminal] [--no-backends]
 # NAME defaults to this PC's hostname.
 set -euo pipefail
@@ -16,6 +17,7 @@ while [ $# -gt 0 ]; do
     --url) URL="$2"; shift 2;;
     --no-backends) BACKENDS=0; shift;;
     --yes|-y) YES=1; shift;;
+    --uninstall) shift; exec "${MCPGW_HOME:-$HOME/.mcp-gateway}/bin/mcp-gateway" uninstall "$@";;
     --no-desktop) DESKTOP=0; shift;;
     --no-funnel) FUNNEL=0; shift;;
     --no-open-terminal) OPENTERM=0; shift;;

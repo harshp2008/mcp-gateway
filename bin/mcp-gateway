@@ -7,6 +7,7 @@
   mcp-gateway client add NAME      per-client static token (Claude Code, scripts)
   mcp-gateway trust list|revoke SUBJECT|add SUBJECT [DAYS]
   mcp-gateway desktop [--yes] [--keep-duplicates]  wire Claude Desktop to the gateway (asks before closing it)
+  mcp-gateway uninstall [--dry-run] [--yes] [--keep-data] [--keep-desktop]   remove everything this installer set up
   mcp-gateway funnel               expose this PC via Tailscale Funnel + set the public URL
   mcp-gateway connect [claude-desktop|claude-code|gemini|other]
   mcp-gateway extension [--only NAME..]  Gemini auto-allow Chrome extension (all mcp-* connectors) + install steps
@@ -424,6 +425,108 @@ def cmd_funnel(args):
           f"Only these paths are exposed: {' '.join(FUNNEL_PATHS)}")
 
 
+# ---------------------------------------------------------------- uninstall
+def cmd_uninstall(args):
+    yes, dry = "--yes" in args, "--dry-run" in args
+    keep_data, keep_desktop = "--keep-data" in args, "--keep-desktop" in args
+    s = load()
+    n = machine_name(s); key = f"mcp-{n}"
+    unit_dir = os.path.expanduser("~/.config/systemd/user")
+    units = [f"{unit_dir}/mcp-gateway.service", f"{unit_dir}/mcp-gateway-approver.service"]
+    try:
+        mine = HOME in open(units[0]).read()      # the installed service belongs to THIS home
+    except FileNotFoundError:
+        mine = False
+    link = os.path.expanduser("~/.local/bin/mcp-gateway")
+    safe_home = (os.path.isfile(SETTINGS) or os.path.isfile(ENVF)) and os.path.realpath(HOME) not in ("/", os.path.expanduser("~"))
+    plan = []
+    if mine: plan.append("stop + disable the mcp-gateway and approval-popup services, delete their unit files")
+    if mine and s.get("public_url") and shutil.which("tailscale"):
+        plan.append("turn OFF only this gateway's Tailscale Funnel paths on port %d (other Tailscale settings untouched)" % FUNNEL_PORT)
+    desk = False
+    if not keep_desktop and os.path.exists(DESKTOP_CFG):
+        try:
+            c = json.load(open(DESKTOP_CFG))
+            desk = key in c.get("mcpServers", {})
+        except ValueError:
+            pass
+        if desk:
+            plan.append(f"remove '{key}' from Claude Desktop and put back any servers moved to _disabledMcpServers (closes + reopens Desktop)")
+    if os.path.islink(link): plan.append(f"remove {link}")
+    if not keep_data and safe_home: plan.append(f"DELETE {HOME} (config, tokens, trust list, OAuth signing key, logs, the extension folder)")
+    if keep_data: plan.append(f"keep {HOME} (--keep-data)")
+    if not plan:
+        print("nothing to remove for this install."); return
+    print("This will:"); [print("  -", x) for x in plan]
+    print("Not touched: Tailscale, open-terminal, Go, dcg's own hook in Claude Code settings, the cloned repo, your Gemini connector.")
+    if dry: print("\n(dry run - nothing changed)"); return
+    if not ask("Continue?", False, yes): print("Aborted."); return
+
+    # 1) Funnel: only our paths
+    if mine and s.get("public_url") and shutil.which("tailscale"):
+        for pth in FUNNEL_PATHS:
+            subprocess.run(["tailscale", "funnel", f"--https={FUNNEL_PORT}", f"--set-path={pth}", "off"],
+                           capture_output=True, text=True, timeout=60)
+        print("funnel paths turned off")
+    # 2) Claude Desktop
+    if desk:
+        pids = desktop_pids()
+        proceed = True
+        if pids:
+            print("Claude Desktop is running and must be closed (check no chat/task is running).")
+            proceed = ask("Close Claude Desktop now?", False, yes)
+            if proceed:
+                for pid in pids:
+                    try: os.kill(pid, 15)
+                    except ProcessLookupError: pass
+                for _ in range(30):
+                    if not desktop_pids(): break
+                    time.sleep(0.5)
+                if desktop_pids():
+                    if ask("Still running. Force-quit it?", False, yes):
+                        for pid in desktop_pids():
+                            try: os.kill(pid, 9)
+                            except ProcessLookupError: pass
+                        time.sleep(1)
+                    else:
+                        proceed = False
+        if proceed:
+            c = json.load(open(DESKTOP_CFG))
+            srv = c.setdefault("mcpServers", {})
+            srv.pop(key, None)
+            dis = c.get("_disabledMcpServers", {})
+            for name in list(dis):
+                if name not in srv:
+                    srv[name] = dis.pop(name)      # restore what we moved aside
+            if not dis: c.pop("_disabledMcpServers", None)
+            shutil.copy(DESKTOP_CFG, DESKTOP_CFG + ".bak." + datetime.datetime.now().strftime("%Y%m%d%H%M%S"))
+            tmp = DESKTOP_CFG + ".tmp"
+            open(tmp, "w").write(json.dumps(c, indent=2)); os.chmod(tmp, 0o600); os.replace(tmp, DESKTOP_CFG)
+            print(f"Claude Desktop: removed {key}, restored servers that were moved aside")
+            if pids and shutil.which("claude-desktop"):
+                subprocess.Popen([shutil.which("claude-desktop")], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL, start_new_session=True)
+                print("Claude Desktop reopened")
+        else:
+            print("Skipped Claude Desktop (still has the gateway entry; re-run: mcp-gateway uninstall)")
+    # 3) services
+    if mine:
+        for u in ("mcp-gateway-approver", "mcp-gateway"):
+            sctl("disable", "--now", u + ".service")
+        for f in units:
+            try: os.remove(f)
+            except FileNotFoundError: pass
+        sctl("daemon-reload")
+        print("services removed")
+    # 4) symlink + data (last: this script lives in HOME, fine on Linux)
+    if os.path.islink(link):
+        os.remove(link)
+    if not keep_data and safe_home:
+        shutil.rmtree(HOME)
+        print(f"deleted {HOME}")
+    print("\nDone. Remember to: delete the connector in Gemini, and remove the Chrome extension at chrome://extensions if you loaded it.")
+
+
 def cmd_status(_):
     s = load()
     print(f"name: mcp-{machine_name(s)}   url: {s.get('public_url') or '(local only)'}")
@@ -471,7 +574,7 @@ def main():
         print(__doc__); return
     c, rest = a[0], a[1:]
     table = {"name": cmd_name, "url": cmd_url, "backend": cmd_backend, "client": cmd_client, "trust": cmd_trust,
-             "connect": cmd_connect, "status": cmd_status, "extension": lambda r: make_ext(r), "desktop": cmd_desktop, "funnel": cmd_funnel}
+             "connect": cmd_connect, "status": cmd_status, "extension": lambda r: make_ext(r), "desktop": cmd_desktop, "funnel": cmd_funnel, "uninstall": cmd_uninstall, "remove": cmd_uninstall}
     if c in table:
         table[c](rest)
     elif c == "render":
