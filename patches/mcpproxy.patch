@@ -1033,7 +1033,7 @@ index 421ef69..956ae7c 100644
  	}
  	if c.Approvals.Timeout == 0 {
 diff --git a/gateway/conn.go b/gateway/conn.go
-index 3287427..a39f299 100644
+index 3287427..0df5290 100644
 --- a/gateway/conn.go
 +++ b/gateway/conn.go
 @@ -1,6 +1,7 @@
@@ -1044,7 +1044,7 @@ index 3287427..a39f299 100644
  	"context"
  	"encoding/json"
  	"fmt"
-@@ -451,7 +452,18 @@ func (c *conn) fanoutInitialize(ctx context.Context, env *jsonrpc.Message) (*jso
+@@ -451,7 +452,15 @@ func (c *conn) fanoutInitialize(ctx context.Context, env *jsonrpc.Message) (*jso
  	if c.g.aggregated() && first != nil {
  		var res mcp.InitializeResult
  		if err := json.Unmarshal(first.Result, &res); err == nil {
@@ -1054,9 +1054,6 @@ index 3287427..a39f299 100644
 +				name = n
 +			}
 +			res.ServerInfo = mcp.Implementation{Name: name, Version: "0.1.0"}
-+			if pub := os.Getenv("MCP_PUBLIC_URL"); pub != "" {
-+				res.ServerInfo.Icons = []mcp.Icon{{Src: strings.TrimRight(pub, "/") + "/icon.png", MimeType: "image/png", Sizes: []string{"128x128"}}}
-+			}
 +			if lbl := os.Getenv("MCP_LABEL"); lbl != "" {
 +				res.Instructions = "This gateway controls ONE specific computer: " + lbl +
 +					". Every tool here runs on " + lbl + " and nowhere else. If the user asked for a different computer, do not use these tools."
