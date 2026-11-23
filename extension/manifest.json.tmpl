@@ -1,0 +1,9 @@
+{
+  "manifest_version": 3,
+  "name": "Gemini: auto-allow mcp-@NAME@",
+  "version": "1.0",
+  "description": "Auto-clicks Allow on Gemini tool-permission cards for the mcp-@NAME@ connector only. Dangerous commands are blocked by the gateway-side dcg filter.",
+  "content_scripts": [
+    { "matches": ["https://gemini.google.com/*"], "js": ["content.js"], "run_at": "document_idle" }
+  ]
+}

@@ -69,6 +69,13 @@ mcp-gateway url https://<machine>.<tailnet>.ts.net:10000
 ```
 Gemini → Settings → connectors → add custom MCP connector: name `mcp-main-laptop`, URL `https://<machine>.<tailnet>.ts.net:10000/mcp`, auth OAuth. A popup appears **on the PC**: "Approve & trust". In chats, @mention the connector.
 
+#### Optional: stop Gemini's per-call "Allow" cards
+Gemini asks permission on every tool call and that can't be disabled server-side. `install.sh` generates a small Chrome extension in `~/.mcp-gateway/extension` that clicks Allow for **this PC's connector only**:
+```bash
+mcp-gateway extension    # (re)writes it and prints the steps
+```
+Then Chrome -> `chrome://extensions` -> Developer mode -> **Load unpacked** -> pick `~/.mcp-gateway/extension` -> reload Gemini. Re-run it after renaming the PC. Dangerous shell commands are still blocked by dcg.
+
 ### Two (or more) PCs
 Run `./install.sh --name old-laptop` on each, give each its own Funnel URL, add one connector per PC (`@mcp-main-laptop`, `@mcp-old-laptop`). The name appears in the server name and in tool instructions ("you are running on OLD-LAPTOP").
 

@@ -82,7 +82,9 @@ fi
 say "Installing CLI and approval popup"
 install -m 755 "$REPO_DIR/bin/mcp-gateway" "$HOME_DIR/bin/mcp-gateway"
 install -m 644 "$REPO_DIR/gateway/approver.py" "$HOME_DIR/approver.py"
-rm -rf "$HOME_DIR/app/tests"; cp -r "$REPO_DIR/tests" "$HOME_DIR/app/tests"
+mkdir -p "$HOME_DIR/app/tests" "$HOME_DIR/app/extension"
+cp -r "$REPO_DIR/tests/." "$HOME_DIR/app/tests/"
+cp -r "$REPO_DIR/extension/." "$HOME_DIR/app/extension/"
 ln -sf "$HOME_DIR/bin/mcp-gateway" "$HOME/.local/bin/mcp-gateway"
 case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) echo "NOTE: add ~/.local/bin to PATH";; esac
 
@@ -110,6 +112,7 @@ if [ "$BACKENDS" = 1 ]; then
   command -v figcraft-cli >/dev/null && "$CLI" backend add figcraft >/dev/null && echo "backend: figcraft" || true
 fi
 "$CLI" render >/dev/null
+"$CLI" extension >/dev/null
 systemctl --user daemon-reload
 systemctl --user enable --now mcp-gateway.service
 systemctl --user enable --now mcp-gateway-approver.service 2>/dev/null || echo "(approver starts with your desktop session)"
@@ -119,6 +122,7 @@ say "Done"
 cat <<EOF
 
 Next:
+  mcp-gateway extension          # Chrome extension that auto-clicks Gemini's Allow card (steps printed)
   mcp-gateway connect            # copy-paste setup for Claude Desktop / Claude Code / Gemini
   mcp-gateway name my-laptop     # rename this PC (default is hostname)
   mcp-gateway backend add NAME -- <command> <args>   # add any other MCP server
