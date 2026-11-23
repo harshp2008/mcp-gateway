@@ -111,15 +111,24 @@ if n: s["name"]=n
 if u: s["public_url"]=u.rstrip("/")
 json.dump(s,open(p,"w"),indent=2)
 PY
-# open-terminal = the shell/files MCP server. It needs the [mcp] extra, or `open-terminal mcp` exits 1.
+# open-terminal = the shell/files MCP server. Two known problems on fresh installs:
+#  1) it needs the [mcp] extra, 2) upstream passes host/port in stdio mode, which new fastmcp
+#  rejects -> `open-terminal mcp` exits 1 and breaks EVERY gateway session. We install the extra
+#  and apply a one-line fix (gateway/patch_open_terminal.py), then probe that it really starts.
 ot_ok() { command -v open-terminal >/dev/null 2>&1 && OPEN_TERMINAL_API_KEY=probe timeout 8 open-terminal mcp --cwd / </dev/null >/dev/null 2>&1; }
-if [ "$BACKENDS" = 1 ] && [ "$OPENTERM" = 1 ] && ! ot_ok; then
-  say "Installing open-terminal[mcp]"
-  if command -v uv >/dev/null 2>&1; then uv tool install --force 'open-terminal[mcp]'
-  elif command -v pipx >/dev/null 2>&1; then pipx install --force 'open-terminal[mcp]'
-  else python3 -m pip install --user --break-system-packages 'open-terminal[mcp]'; fi || echo "open-terminal install failed; install 'open-terminal[mcp]' manually, then: mcp-gateway backend add terminal"
+if [ "$BACKENDS" = 1 ] && [ "$OPENTERM" = 1 ]; then
   export PATH="$HOME/.local/bin:$PATH"
-  ot_ok || echo "WARNING: 'open-terminal mcp' still fails to start; the terminal backend will break the gateway. Run it by hand to see why."
+  if ! ot_ok; then
+    command -v open-terminal >/dev/null 2>&1 && python3 -I "$REPO_DIR/gateway/patch_open_terminal.py" >/dev/null 2>&1 || true
+  fi
+  if ! ot_ok; then
+    say "Installing open-terminal[mcp]"
+    if command -v uv >/dev/null 2>&1; then uv tool install --force 'open-terminal[mcp]'
+    elif command -v pipx >/dev/null 2>&1; then pipx install --force 'open-terminal[mcp]'
+    else python3 -m pip install --user --break-system-packages 'open-terminal[mcp]'; fi || echo "open-terminal install failed; install 'open-terminal[mcp]' manually, then: mcp-gateway backend add terminal"
+    python3 -I "$REPO_DIR/gateway/patch_open_terminal.py" || true
+    ot_ok || echo "WARNING: 'open-terminal mcp' still fails to start; the terminal backend will break the gateway. Run it by hand to see why."
+  fi
 fi
 if [ "$BACKENDS" = 1 ]; then
   command -v open-terminal >/dev/null && "$CLI" backend add terminal >/dev/null && echo "backend: terminal (open-terminal found)" || echo "skip terminal (open-terminal not installed: pip install open-terminal)"
