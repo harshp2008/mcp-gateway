@@ -154,10 +154,22 @@ fi
 
 if [ "$FUNNEL" = 1 ]; then
   say "Public access (Tailscale Funnel) - needed for Gemini/web apps, not for Claude Desktop/Code"
-  if command -v tailscale >/dev/null 2>&1; then
-    if ask "Expose this PC through Tailscale Funnel now?"; then "$CLI" funnel || echo "(fix the message above, then run: mcp-gateway funnel)"; fi
+  if ask "Set up public access now? (installs Tailscale if missing - needs sudo - and opens a login link)"; then
+    if ! command -v tailscale >/dev/null 2>&1; then
+      echo "Installing Tailscale (official installer from tailscale.com, asks for your sudo password)..."
+      curl -fsSL https://tailscale.com/install.sh | sh || echo "Tailscale install failed; install it manually: https://tailscale.com/download"
+    fi
+    if command -v tailscale >/dev/null 2>&1; then
+      if ! tailscale status --json 2>/dev/null | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("BackendState")=="Running" else 1)'; then
+        echo
+        echo "Log in to Tailscale: open the link below in your browser (use the SAME account as your other PCs)."
+        sudo tailscale up || echo "tailscale up failed/cancelled"
+      fi
+      sudo tailscale set --operator="$USER" 2>/dev/null || true   # lets us manage Funnel without sudo
+      "$CLI" funnel || echo "(fix the message above, then run: mcp-gateway funnel)"
+    fi
   else
-    echo "Tailscale not installed. Later: curl -fsSL https://tailscale.com/install.sh | sh && sudo tailscale up && mcp-gateway funnel"
+    echo "Skipped. Later: mcp-gateway funnel   (install Tailscale first: curl -fsSL https://tailscale.com/install.sh | sh && sudo tailscale up)"
   fi
 fi
 
