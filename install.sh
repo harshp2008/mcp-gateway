@@ -111,13 +111,15 @@ if n: s["name"]=n
 if u: s["public_url"]=u.rstrip("/")
 json.dump(s,open(p,"w"),indent=2)
 PY
-# open-terminal = the shell/files MCP server; install it if missing
-if [ "$BACKENDS" = 1 ] && [ "$OPENTERM" = 1 ] && ! command -v open-terminal >/dev/null 2>&1; then
-  say "Installing open-terminal"
-  if command -v uv >/dev/null 2>&1; then uv tool install open-terminal
-  elif command -v pipx >/dev/null 2>&1; then pipx install open-terminal
-  else python3 -m pip install --user --break-system-packages open-terminal; fi || echo "open-terminal install failed; install it manually and run: mcp-gateway backend add terminal"
+# open-terminal = the shell/files MCP server. It needs the [mcp] extra, or `open-terminal mcp` exits 1.
+ot_ok() { command -v open-terminal >/dev/null 2>&1 && OPEN_TERMINAL_API_KEY=probe timeout 8 open-terminal mcp --cwd / </dev/null >/dev/null 2>&1; }
+if [ "$BACKENDS" = 1 ] && [ "$OPENTERM" = 1 ] && ! ot_ok; then
+  say "Installing open-terminal[mcp]"
+  if command -v uv >/dev/null 2>&1; then uv tool install --force 'open-terminal[mcp]'
+  elif command -v pipx >/dev/null 2>&1; then pipx install --force 'open-terminal[mcp]'
+  else python3 -m pip install --user --break-system-packages 'open-terminal[mcp]'; fi || echo "open-terminal install failed; install 'open-terminal[mcp]' manually, then: mcp-gateway backend add terminal"
   export PATH="$HOME/.local/bin:$PATH"
+  ot_ok || echo "WARNING: 'open-terminal mcp' still fails to start; the terminal backend will break the gateway. Run it by hand to see why."
 fi
 if [ "$BACKENDS" = 1 ]; then
   command -v open-terminal >/dev/null && "$CLI" backend add terminal >/dev/null && echo "backend: terminal (open-terminal found)" || echo "skip terminal (open-terminal not installed: pip install open-terminal)"
