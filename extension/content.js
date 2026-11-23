@@ -1,8 +1,10 @@
 // Auto-click Gemini's tool-permission card ("Allow" / "Allow once") for your mcp-gateway connectors.
 // ALLOW = connector-name prefixes to auto-allow. Default "mcp " = every connector named mcp-*
 // (mcp-main-laptop, mcp-old-laptop, ...). Narrow it with: mcp-gateway extension --only mcp-main-laptop
-// Handles both card layouts (Allow once / Always allow / Don't allow  and  Deny / Allow), buttons,
-// role=button elements and open shadow DOMs. The connector is read from: Let Gemini use "<tool>" from <connector>
+// Handles every card layout Gemini has used:
+//   - Deny / Allow, with "Let Gemini use "<tool>" from <connector>"
+//   - Don't allow / Allow once / Always allow, with the connector name as a header above "Let Gemini use <tool>?"
+// Buttons, role=button elements and open shadow DOMs all work. A card whose connector can't be identified is ignored.
 (() => {
   const norm = s => (s || "").toLowerCase().replace(/[-_\s]+/g, " ").trim();
   const ALLOW = ["mcp "]; // @ALLOW@
@@ -19,12 +21,12 @@
   const parentOf = el => el.parentElement || (el.getRootNode && el.getRootNode().host) || null;
   const clickable = el => el.closest("button,[role=button],a") || el;
   const allowed = name => { const n = norm(name); return ALLOW.some(p => n.startsWith(p)); };
-  // connector name from the card sentence; falls back to the text before it
+  // connector name: "...from <name>" if present, else the header text right before "Let Gemini use"
   const connectorOf = t => {
     const m = t.match(/Let Gemini use\s+["“][^"”]*["”]\s+from\s+(\S+)/i);
     if (m) return m[1];
     const i = t.indexOf("Let Gemini use");
-    return i > 0 ? t.slice(0, i) : "";
+    return i > 0 ? t.slice(0, i).trim() : "";
   };
 
   function tryClick(el, n = 0) {
@@ -43,16 +45,18 @@
       if (el.children.length > 1) continue;
       const btn = clickable(el);
       if (handled.has(btn)) continue;
-      // climb to the smallest ancestor holding the card sentence; cap keeps us out of the whole chat
+      // climb until an ancestor holds the card sentence AND names the connector; the cap keeps us out of the whole chat
       let card = parentOf(btn), found = false, name = "", text = "";
-      for (let i = 0; i < 20 && card; i++, card = parentOf(card)) {
+      for (let i = 0; i < 25 && card; i++, card = parentOf(card)) {
         const t = card.textContent || "";
         if (t.length > 6000) break;
-        if (t.includes("Let Gemini use")) { found = true; text = t; name = connectorOf(t); break; }
+        if (!t.includes("Let Gemini use")) continue;
+        found = true; text = t; name = connectorOf(t);
+        if (name) break; // header not inside this ancestor yet: keep climbing
       }
       handled.add(btn);
       if (!found) { log('saw "' + label + '" but no "Let Gemini use" ancestor'); continue; }
-      if (allowed(name)) {
+      if (name && allowed(name)) {
         log("card for", name, "->", btn.tagName, '"' + label + '"');
         setTimeout(() => tryClick(btn), 200);
       } else {
