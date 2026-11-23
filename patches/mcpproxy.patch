@@ -1,0 +1,1021 @@
+diff --git a/auth/authserver/authorize.go b/auth/authserver/authorize.go
+index 4af08a9..a098ccf 100644
+--- a/auth/authserver/authorize.go
++++ b/auth/authserver/authorize.go
+@@ -79,13 +79,25 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
+ 	}
+ 
+ 	if s.upstream == nil {
+-		// No IdP: every caller is the same user. That suits local development
+-		// and is dangerous anywhere else, hence a warning per authorization.
+-		s.log.Warn("auth server has no upstream IdP; auto-approving as dev identity",
+-			"subject", devSubject, "client_id", clientID)
+-		g.Subject = devSubject
+-		g.Email = devSubject + "@localhost"
+-		g.Claims = map[string]any{"sub": devSubject, "email": g.Email}
++		// Local patch: no IdP. The gateway owner approves each new client
++		// (and the identity is per-client, never a shared dev user).
++		if s.consent == nil {
++			redirectErr("access_denied", "no consent mechanism configured")
++			return
++		}
++		host := ""
++		if u, err := url.Parse(redirectURI); err == nil {
++			host = u.Host
++		}
++		ok, err := s.consent(r.Context(), ConsentRequest{ClientID: clientID, ClientName: c.Name, RedirectHost: host})
++		if err != nil || !ok {
++			s.log.Warn("oauth consent denied", "client_id", clientID, "client_name", c.Name, "error", err)
++			redirectErr("access_denied", "the gateway owner did not approve this client")
++			return
++		}
++		g.Subject = "oauth:" + clientID
++		g.Email = ""
++		g.Claims = map[string]any{"sub": g.Subject, "client_name": c.Name}
+ 		s.issueCode(w, r, g)
+ 		return
+ 	}
+diff --git a/auth/authserver/consent.go b/auth/authserver/consent.go
+new file mode 100644
+index 0000000..ce8fbaf
+--- /dev/null
++++ b/auth/authserver/consent.go
+@@ -0,0 +1,16 @@
++package authserver
++
++import "context"
++
++// ConsentRequest describes a client asking for authorization.
++type ConsentRequest struct {
++	ClientID     string
++	ClientName   string
++	RedirectHost string
++}
++
++// ConsentFunc blocks until the gateway owner approves or denies.
++type ConsentFunc func(ctx context.Context, req ConsentRequest) (bool, error)
++
++// SetConsent installs the owner-consent hook (local patch).
++func (s *Server) SetConsent(f ConsentFunc) { s.consent = f }
+diff --git a/auth/authserver/server.go b/auth/authserver/server.go
+index 4d868cc..1240e8e 100644
+--- a/auth/authserver/server.go
++++ b/auth/authserver/server.go
+@@ -64,6 +64,10 @@ type Server struct {
+ 	store    *store
+ 	log      *slog.Logger
+ 
++	// consent (local patch) decides /authorize when no upstream IdP exists.
++	// nil means refuse: the server never auto-approves.
++	consent ConsentFunc
++
+ 	// now is the clock, swappable in tests.
+ 	now func() time.Time
+ }
+@@ -109,6 +113,9 @@ func New(cfg config.AuthServer, upstream UpstreamFederator) (*Server, error) {
+ 		log:      slog.Default().With("component", "authserver"),
+ 		now:      time.Now,
+ 	}
++	if cfg.ClientsFile != "" {
++		s.store.loadClients(cfg.ClientsFile)
++	}
+ 	if cfg.SigningKeyFile == "" {
+ 		s.log.Warn("auth server signing key is ephemeral; set signing_key_file to survive restarts")
+ 	}
+@@ -224,7 +231,10 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
+ 		Name:         req.ClientName,
+ 		IssuedAt:     now,
+ 	}
+-	s.store.putClient(c)
++	if !s.store.putClient(c) {
++		writeOAuthError(w, http.StatusServiceUnavailable, "temporarily_unavailable", "client registry full")
++		return
++	}
+ 	s.log.Debug("registered client", "client_id", id, "client_name", req.ClientName)
+ 
+ 	writeJSON(w, http.StatusCreated, registrationResponse{
+diff --git a/auth/authserver/store.go b/auth/authserver/store.go
+index 5810490..b91e446 100644
+--- a/auth/authserver/store.go
++++ b/auth/authserver/store.go
+@@ -3,7 +3,9 @@ package authserver
+ import (
+ 	"crypto/rand"
+ 	"encoding/base64"
++	"encoding/json"
+ 	"fmt"
++	"os"
+ 	"sync"
+ 	"time"
+ 
+@@ -23,10 +25,10 @@ const grantTTL = 15 * time.Minute
+ // secret: MCP clients are native and CLI apps that cannot keep one, so PKCE
+ // is mandatory here.
+ type client struct {
+-	ID           string
+-	RedirectURIs []string
+-	Name         string
+-	IssuedAt     time.Time
++	ID           string    `json:"id"`
++	RedirectURIs []string  `json:"redirect_uris"`
++	Name         string    `json:"name"`
++	IssuedAt     time.Time `json:"issued_at"`
+ }
+ 
+ // allowsRedirect reports whether uri was registered. The exact string match
+@@ -90,6 +92,39 @@ type store struct {
+ 	codes    map[string]*grant
+ 	refresh  map[string]*refreshGrant
+ 	upstream map[string]*outbound.Token // subject -> upstream tokens
++
++	clientsFile string // local patch: persisted DCR clients
++}
++
++const maxClients = 50
++
++func (s *store) loadClients(path string) {
++	s.clientsFile = path
++	b, err := os.ReadFile(path)
++	if err != nil {
++		return
++	}
++	var m map[string]*client
++	if json.Unmarshal(b, &m) == nil {
++		for k, v := range m {
++			s.clients[k] = v
++		}
++	}
++}
++
++// saveClientsLocked writes the client table; caller holds s.mu.
++func (s *store) saveClientsLocked() {
++	if s.clientsFile == "" {
++		return
++	}
++	b, err := json.MarshalIndent(s.clients, "", "  ")
++	if err != nil {
++		return
++	}
++	tmp := s.clientsFile + ".tmp"
++	if os.WriteFile(tmp, b, 0o600) == nil {
++		_ = os.Rename(tmp, s.clientsFile)
++	}
+ }
+ 
+ func newStore() *store {
+@@ -102,10 +137,15 @@ func newStore() *store {
+ 	}
+ }
+ 
+-func (s *store) putClient(c *client) {
++func (s *store) putClient(c *client) bool {
+ 	s.mu.Lock()
+ 	defer s.mu.Unlock()
++	if len(s.clients) >= maxClients {
++		return false
++	}
+ 	s.clients[c.ID] = c
++	s.saveClientsLocked()
++	return true
+ }
+ 
+ func (s *store) getClient(id string) (*client, bool) {
+diff --git a/auth/inbound/inbound.go b/auth/inbound/inbound.go
+index aa5bee8..2400e13 100644
+--- a/auth/inbound/inbound.go
++++ b/auth/inbound/inbound.go
+@@ -41,6 +41,9 @@ func New(cfg config.Inbound) (Resolver, error) {
+ 	case "local":
+ 		return Local()
+ 	case "static":
++		if len(cfg.Tokens) > 0 {
++			return StaticNamed(cfg.Token, cfg.Tokens)
++		}
+ 		return Static(cfg.Token)
+ 	case "oidc":
+ 		return OIDC(OIDCOptions{
+diff --git a/auth/inbound/static.go b/auth/inbound/static.go
+index bd2fee4..b4304a6 100644
+--- a/auth/inbound/static.go
++++ b/auth/inbound/static.go
+@@ -38,3 +38,40 @@ func Static(token string) (Resolver, error) {
+ 		return id, nil
+ 	}, nil
+ }
++
++// StaticNamed accepts the optional shared token plus named per-client tokens
++// (local patch). A named token yields Subject "client:<name>". Every
++// candidate is compared in constant time with no early exit.
++func StaticNamed(shared string, named map[string]string) (Resolver, error) {
++	type entry struct {
++		want []byte
++		id   inspect.Identity
++	}
++	var all []entry
++	if shared != "" {
++		all = append(all, entry{[]byte(shared), inspect.Identity{Subject: StaticSubject}})
++	}
++	for name, tok := range named {
++		if tok == "" {
++			return nil, fmt.Errorf("inbound static: token for client %q is empty", name)
++		}
++		all = append(all, entry{[]byte(tok), inspect.Identity{Subject: "client:" + name}})
++	}
++	return func(r *http.Request) (inspect.Identity, error) {
++		got, err := bearerToken(r)
++		if err != nil {
++			return inspect.Identity{}, err
++		}
++		var found inspect.Identity
++		ok := 0
++		for _, e := range all {
++			if subtle.ConstantTimeCompare([]byte(got), e.want) == 1 {
++				found, ok = e.id, 1
++			}
++		}
++		if ok != 1 {
++			return inspect.Identity{}, fmt.Errorf("%w: invalid static token", ErrUnauthenticated)
++		}
++		return found, nil
++	}, nil
++}
+diff --git a/checks/approval.go b/checks/approval.go
+index e382bfa..aff47c7 100644
+--- a/checks/approval.go
++++ b/checks/approval.go
+@@ -3,6 +3,7 @@ package checks
+ import (
+ 	"context"
+ 	"fmt"
++	"strings"
+ 
+ 	"github.com/hoophq/mcpproxy/config"
+ 	"github.com/hoophq/mcpproxy/inspect"
+@@ -13,7 +14,8 @@ import (
+ // wait for anything: it returns Hold and the gateway parks the message in its
+ // HeldStore, resuming or refusing it when a reviewer answers.
+ type Approval struct {
+-	tools []string
++	tools    []string
++	subjects []string // local patch: restrict gating to these caller subjects
+ 	// held reports whether an approval store is wired. Without one a Hold
+ 	// would strand the call forever, so the check refuses instead. Failing
+ 	// closed is the only safe reading of "this tool needs approval".
+@@ -23,7 +25,7 @@ type Approval struct {
+ // NewApproval builds the approval-marker check. heldEnabled must reflect
+ // whether the gateway has a HeldStore.
+ func NewApproval(pol config.Policy, heldEnabled bool) *Approval {
+-	return &Approval{tools: pol.ApprovalTools, held: heldEnabled}
++	return &Approval{tools: pol.ApprovalTools, subjects: pol.ApprovalSubjects, held: heldEnabled}
+ }
+ 
+ // Name implements inspect.Check.
+@@ -36,9 +38,14 @@ func (a *Approval) Inspect(_ context.Context, s inspect.Session, m *inspect.Msg)
+ 		return inspect.AllowAll
+ 	}
+ 	tool := RealToolName(s, exposed)
+-	if !MatchAny(a.tools, tool) {
++	if !matchApproval(a.tools, m.Backend, tool) {
+ 		return inspect.AllowAll
+ 	}
++	if len(a.subjects) > 0 {
++		if sub := s.Identity().Subject; sub != "" && !MatchAny(a.subjects, sub) {
++			return inspect.AllowAll
++		}
++	}
+ 	if !a.held {
+ 		return inspect.Denyf(m.Env, jsonrpc.CodePolicyDenied, NameApproval,
+ 			fmt.Sprintf("tool %q requires approval but no approval store is configured", exposed))
+@@ -49,3 +56,21 @@ func (a *Approval) Inspect(_ context.Context, s inspect.Session, m *inspect.Msg)
+ 		Reason:  fmt.Sprintf("tool %q requires approval", exposed),
+ 	}
+ }
++
++// matchApproval is MatchAny with optional backend scoping (local patch): a
++// pattern "backend/tool" only matches calls routed to that backend (both parts
++// are globs); a pattern without "/" matches the tool name on any backend.
++func matchApproval(patterns []string, backend, tool string) bool {
++	for _, p := range patterns {
++		if i := strings.Index(p, "/"); i >= 0 {
++			if MatchAny([]string{p[:i]}, backend) && MatchAny([]string{p[i+1:]}, tool) {
++				return true
++			}
++			continue
++		}
++		if MatchAny([]string{p}, tool) {
++			return true
++		}
++	}
++	return false
++}
+diff --git a/checks/checks.go b/checks/checks.go
+index cfb2add..694a303 100644
+--- a/checks/checks.go
++++ b/checks/checks.go
+@@ -62,14 +62,17 @@ const (
+ // with no hook cannot fire, and it would still cost a pass over every
+ // message.
+ func Assemble(pol config.Policy, hooks inspect.Hooks, sink audit.Sink, heldEnabled bool) []inspect.Check {
+-	out := make([]inspect.Check, 0, 9)
++	out := make([]inspect.Check, 0, 10)
+ 	out = append(out,
++		NewSessionGate(pol),
+ 		NewBudget(pol, sink),
+ 		NewPolicy(pol),
++		NewCmdGuard(pol),
+ 		NewApproval(pol, heldEnabled),
+ 		NewS2CGate(pol),
+ 		NewRugPull(pol, sink),
+ 		NewOverrides(pol),
++		NewLabel(),
+ 	)
+ 	if hooks.GuardInput != nil {
+ 		out = append(out, NewGuardrails(hooks, sink))
+diff --git a/checks/cmdguard.go b/checks/cmdguard.go
+new file mode 100644
+index 0000000..29d892a
+--- /dev/null
++++ b/checks/cmdguard.go
+@@ -0,0 +1,115 @@
++package checks
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"fmt"
++	"os"
++	"os/exec"
++	"strings"
++	"time"
++
++	"github.com/hoophq/mcpproxy/config"
++	"github.com/hoophq/mcpproxy/inspect"
++	"github.com/hoophq/mcpproxy/jsonrpc"
++)
++
++// NameCmdGuard is the audit rule for denials from the command guard.
++const NameCmdGuard = "command-guard"
++
++// CmdGuard (local patch) asks an external destructive-command guard (dcg) about
++// the shell command in matching tool calls. It fails CLOSED: if the guard
++// cannot be run or answers garbage, the call is denied.
++type CmdGuard struct {
++	bin   string
++	tools []string
++}
++
++// NewCmdGuard builds the check; with no binary or tools it allows everything.
++func NewCmdGuard(pol config.Policy) *CmdGuard {
++	return &CmdGuard{bin: pol.CommandGuardBin, tools: pol.CommandGuardTools}
++}
++
++// Name implements inspect.Check.
++func (c *CmdGuard) Name() string { return NameCmdGuard }
++
++// Inspect implements inspect.Check.
++func (c *CmdGuard) Inspect(ctx context.Context, s inspect.Session, m *inspect.Msg) inspect.Decision {
++	exposed, ok := isToolCall(m)
++	if !ok || c.bin == "" || len(c.tools) == 0 {
++		return inspect.AllowAll
++	}
++	tool := RealToolName(s, exposed)
++	if !matchApproval(c.tools, m.Backend, tool) {
++		return inspect.AllowAll
++	}
++	var p struct {
++		Arguments map[string]any `json:"arguments"`
++	}
++	if err := json.Unmarshal(m.Env.Params, &p); err != nil {
++		return c.deny(m, "cannot parse tool arguments")
++	}
++	for _, key := range []string{"command", "input"} {
++		v, ok := p.Arguments[key].(string)
++		if !ok || strings.TrimSpace(v) == "" {
++			continue
++		}
++		if reason := c.check(ctx, v); reason != "" {
++			return c.deny(m, reason)
++		}
++	}
++	return inspect.AllowAll
++}
++
++func (c *CmdGuard) deny(m *inspect.Msg, reason string) inspect.Decision {
++	return inspect.Denyf(m.Env, jsonrpc.CodePolicyDenied, NameCmdGuard,
++		fmt.Sprintf("blocked by command guard: %s", reason))
++}
++
++// check returns "" when the command is allowed, else a short reason.
++func (c *CmdGuard) check(ctx context.Context, command string) string {
++	in, _ := json.Marshal(map[string]any{
++		"tool_name":  "Bash",
++		"tool_input": map[string]string{"command": command},
++	})
++	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
++	defer cancel()
++	cmd := exec.CommandContext(cctx, c.bin)
++	cmd.Stdin = bytes.NewReader(in)
++	// Keep dcg from "repairing" hooks in the real Claude Code settings.
++	cmd.Env = append(os.Environ(), "CLAUDE_CONFIG_DIR=/tmp/dcg-null-config", "DCG_QUIET=1", "DCG_NO_COLOR=1")
++	var out bytes.Buffer
++	cmd.Stdout = &out
++	if err := cmd.Run(); err != nil {
++		return "guard failed to run: " + err.Error()
++	}
++	for _, line := range strings.Split(out.String(), "\n") {
++		line = strings.TrimSpace(line)
++		if !strings.HasPrefix(line, "{") {
++			continue
++		}
++		var r struct {
++			Hook struct {
++				Decision string `json:"permissionDecision"`
++				Reason   string `json:"permissionDecisionReason"`
++			} `json:"hookSpecificOutput"`
++			RuleID string `json:"ruleId"`
++		}
++		if json.Unmarshal([]byte(line), &r) != nil {
++			continue
++		}
++		if r.Hook.Decision == "deny" {
++			reason := r.RuleID
++			if i := strings.Index(r.Hook.Reason, "Reason: "); i >= 0 {
++				rest := r.Hook.Reason[i+8:]
++				if j := strings.Index(rest, "\n"); j >= 0 {
++					rest = rest[:j]
++				}
++				reason = r.RuleID + " - " + rest
++			}
++			return reason
++		}
++	}
++	return ""
++}
+diff --git a/checks/label.go b/checks/label.go
+new file mode 100644
+index 0000000..6e7380e
+--- /dev/null
++++ b/checks/label.go
+@@ -0,0 +1,60 @@
++package checks
++
++import (
++	"context"
++	"encoding/json"
++	"os"
++
++	"github.com/hoophq/mcpproxy/inspect"
++	"github.com/hoophq/mcpproxy/mcp"
++)
++
++// NameLabel is the check name for the machine-label rewrite.
++const NameLabel = "machine-label"
++
++// Label (local patch) prefixes every tool description with the machine the
++// gateway controls, so a model with several gateways connected cannot mix
++// them up. Set MCP_LABEL to enable (e.g. "MAIN LAPTOP (harsh-hp)").
++type Label struct{ label string }
++
++// NewLabel reads MCP_LABEL.
++func NewLabel() *Label { return &Label{label: os.Getenv("MCP_LABEL")} }
++
++// Name implements inspect.Check.
++func (l *Label) Name() string { return NameLabel }
++
++// Inspect implements inspect.Check.
++func (l *Label) Inspect(_ context.Context, _ inspect.Session, m *inspect.Msg) inspect.Decision {
++	if l.label == "" {
++		return inspect.AllowAll
++	}
++	res, ok := toolsListResult(m)
++	if !ok {
++		return inspect.AllowAll
++	}
++	changed := false
++	for i, raw := range res.Tools {
++		var f map[string]json.RawMessage
++		if json.Unmarshal(raw, &f) != nil {
++			continue
++		}
++		var desc string
++		_ = json.Unmarshal(f["description"], &desc)
++		desc = "[RUNS ON: " + l.label + "] " + desc + " (Executes on " + l.label + " only.)"
++		db, err := json.Marshal(desc)
++		if err != nil {
++			continue
++		}
++		f["description"] = db
++		if out, err := json.Marshal(f); err == nil {
++			res.Tools[i] = out
++			changed = true
++		}
++	}
++	if changed {
++		if b, err := json.Marshal((*mcp.ToolsListResult)(res)); err == nil {
++			m.Env.Result = b
++		}
++	}
++	return inspect.AllowAll
++}
+diff --git a/checks/sessiongate.go b/checks/sessiongate.go
+new file mode 100644
+index 0000000..7e06181
+--- /dev/null
++++ b/checks/sessiongate.go
+@@ -0,0 +1,201 @@
++package checks
++
++import (
++	"context"
++	"encoding/json"
++	"os"
++	"strings"
++	"sync"
++	"time"
++
++	"github.com/hoophq/mcpproxy/config"
++	"github.com/hoophq/mcpproxy/inspect"
++	"github.com/hoophq/mcpproxy/jsonrpc"
++	"github.com/hoophq/mcpproxy/mcp"
++)
++
++// NameSessionGate is the rule name of session-level approval holds. The
++// gateway matches on this prefix to run the per-session approval flow.
++const NameSessionGate = "session-gate"
++
++const metaKeyGate = "checks.sessiongate"
++
++// GateState is the per-session approval state (local patch).
++type GateState struct {
++	flow sync.Mutex // serialises approval prompts: one popup per session
++
++	mu          sync.Mutex
++	until       time.Time // approved until
++	deniedUntil time.Time // auto-deny window after a rejection/timeout
++	client      string
++	ttl         time.Duration
++}
++
++// GateOf returns the session's gate state.
++func GateOf(s inspect.Session) *GateState {
++	return s.Meta(metaKeyGate, func() any { return &GateState{} }).(*GateState)
++}
++
++// Lock/Unlock serialise the approval flow of one session.
++func (g *GateState) Lock()   { g.flow.Lock() }
++func (g *GateState) Unlock() { g.flow.Unlock() }
++
++// Approved reports whether the session currently holds an approval.
++func (g *GateState) Approved() bool {
++	g.mu.Lock()
++	defer g.mu.Unlock()
++	return time.Now().Before(g.until)
++}
++
++// Denied reports whether the session is inside its post-denial window.
++func (g *GateState) Denied() bool {
++	g.mu.Lock()
++	defer g.mu.Unlock()
++	return time.Now().Before(g.deniedUntil)
++}
++
++// Approve grants access for the configured TTL.
++func (g *GateState) Approve() {
++	g.mu.Lock()
++	defer g.mu.Unlock()
++	g.until = time.Now().Add(g.ttl)
++}
++
++// Deny blocks the session for d, so queued or retried requests do not
++// raise another prompt.
++func (g *GateState) Deny(d time.Duration) {
++	g.mu.Lock()
++	defer g.mu.Unlock()
++	g.deniedUntil = time.Now().Add(d)
++}
++
++// SessionGate holds every session until a human approves it. initialize,
++// ping and notifications pass so clients can connect; everything else
++// (tools/list, tools/call, resources, prompts, ...) waits for approval.
++type SessionGate struct {
++	enabled bool
++	ttl     time.Duration
++	trust   *trustFile
++}
++
++// trustFile is a cached view of the trust list; it re-reads on mtime change.
++// Unreadable or malformed files mean "nobody is trusted" (fail closed).
++type trustFile struct {
++	path string
++	mu   sync.Mutex
++	mod  time.Time
++	size int64
++	m    map[string]time.Time // subject -> expiry (zero = never)
++}
++
++type trustEntry struct {
++	TrustedAt string `json:"trusted_at"`
++	Expires   string `json:"expires,omitempty"`
++}
++
++func (t *trustFile) trusted(subject string) bool {
++	if t == nil || t.path == "" || subject == "" {
++		return false
++	}
++	t.mu.Lock()
++	defer t.mu.Unlock()
++	fi, err := os.Stat(t.path)
++	if err != nil {
++		t.m = nil
++		t.mod = time.Time{}
++		return false
++	}
++	if t.m == nil || !fi.ModTime().Equal(t.mod) || fi.Size() != t.size {
++		t.m = map[string]time.Time{}
++		t.mod, t.size = fi.ModTime(), fi.Size()
++		b, err := os.ReadFile(t.path)
++		if err != nil {
++			return false
++		}
++		var raw map[string]trustEntry
++		if json.Unmarshal(b, &raw) != nil {
++			return false
++		}
++		for k, v := range raw {
++			var exp time.Time
++			if v.Expires != "" {
++				if exp, err = time.Parse(time.RFC3339, v.Expires); err != nil {
++					continue // bad expiry: ignore the entry
++				}
++			}
++			t.m[k] = exp
++		}
++	}
++	exp, ok := t.m[subject]
++	return ok && (exp.IsZero() || time.Now().Before(exp))
++}
++
++// NewSessionGate builds the session gate from policy.
++func NewSessionGate(pol config.Policy) *SessionGate {
++	ttl := pol.SessionTTL
++	if ttl <= 0 {
++		ttl = time.Hour
++	}
++	return &SessionGate{enabled: pol.SessionApproval, ttl: ttl, trust: &trustFile{path: pol.SessionTrustFile}}
++}
++
++// Name implements inspect.Check.
++func (g *SessionGate) Name() string { return NameSessionGate }
++
++// Inspect implements inspect.Check.
++func (g *SessionGate) Inspect(_ context.Context, s inspect.Session, m *inspect.Msg) inspect.Decision {
++	if !g.enabled || m == nil || m.Env == nil || m.Dir != inspect.C2S {
++		return inspect.AllowAll
++	}
++	if g.trust.trusted(s.Identity().Subject) {
++		return inspect.AllowAll
++	}
++	st := GateOf(s)
++	switch {
++	case m.Env.Method == mcp.MethodInitialize:
++		var p struct {
++			ClientInfo struct {
++				Name string `json:"name"`
++			} `json:"clientInfo"`
++		}
++		_ = json.Unmarshal(m.Env.Params, &p)
++		st.mu.Lock()
++		st.client = sanitizeClient(p.ClientInfo.Name)
++		st.mu.Unlock()
++		return inspect.AllowAll
++	case m.Env.Method == mcp.MethodPing, m.Env.IsNotification():
++		return inspect.AllowAll
++	}
++	st.mu.Lock()
++	st.ttl = g.ttl
++	client := st.client
++	st.mu.Unlock()
++	if st.Approved() {
++		return inspect.AllowAll
++	}
++	if st.Denied() {
++		return inspect.Denyf(m.Env, jsonrpc.CodePolicyDenied, NameSessionGate,
++			"session access was denied; ask the owner to approve")
++	}
++	return inspect.Decision{
++		Verdict: inspect.Hold,
++		Rule:    NameSessionGate + "|" + client,
++		Reason:  "session requires approval",
++	}
++}
++
++// IsSessionGateRule reports whether a decision rule came from the gate.
++func IsSessionGateRule(rule string) bool { return strings.HasPrefix(rule, NameSessionGate) }
++
++func sanitizeClient(n string) string {
++	n = strings.Map(func(r rune) rune {
++		if r < 0x20 || r == '|' {
++			return -1
++		}
++		return r
++	}, n)
++	if len(n) > 60 {
++		n = n[:60]
++	}
++	return n
++}
+diff --git a/cmd/mcpproxyd/consent.go b/cmd/mcpproxyd/consent.go
+new file mode 100644
+index 0000000..9fb27ec
+--- /dev/null
++++ b/cmd/mcpproxyd/consent.go
+@@ -0,0 +1,63 @@
++package main
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"sync"
++	"time"
++
++	"github.com/hoophq/mcpproxy/approval"
++	"github.com/hoophq/mcpproxy/auth/authserver"
++	"github.com/hoophq/mcpproxy/gateway"
++)
++
++// newConsent turns OAuth /authorize into a held call that the PC popup answers.
++// Unauthenticated callers can reach /authorize, so it is rate limited: one
++// pending consent at a time, a cooldown after a denial, and an hourly cap.
++func newConsent(held *approval.Store) authserver.ConsentFunc {
++	var mu sync.Mutex
++	pending := false
++	var stamps []time.Time
++	denied := map[string]time.Time{}
++	return func(ctx context.Context, req authserver.ConsentRequest) (bool, error) {
++		mu.Lock()
++		now := time.Now()
++		if t, ok := denied[req.ClientID]; ok && now.Sub(t) < time.Minute {
++			mu.Unlock()
++			return false, errors.New("cooldown after denial")
++		}
++		keep := stamps[:0]
++		for _, t := range stamps {
++			if now.Sub(t) < time.Hour {
++				keep = append(keep, t)
++			}
++		}
++		stamps = keep
++		if pending || len(stamps) >= 10 {
++			mu.Unlock()
++			return false, errors.New("too many consent requests")
++		}
++		pending = true
++		stamps = append(stamps, now)
++		mu.Unlock()
++		defer func() { mu.Lock(); pending = false; mu.Unlock() }()
++
++		args, _ := json.Marshal(map[string]string{
++			"client_id": req.ClientID, "client_name": req.ClientName, "redirect_host": req.RedirectHost})
++		_, ch, err := held.Hold(ctx, gateway.HeldCall{
++			Session: "oauth", User: "oauth:" + req.ClientID, Backend: "gateway",
++			Tool: "oauth-consent", Args: args, Rule: "oauth-consent",
++		})
++		if err != nil {
++			return false, err
++		}
++		ok := <-ch
++		if !ok {
++			mu.Lock()
++			denied[req.ClientID] = time.Now()
++			mu.Unlock()
++		}
++		return ok, nil
++	}
++}
+diff --git a/cmd/mcpproxyd/main.go b/cmd/mcpproxyd/main.go
+index 75f897e..0fd9a41 100644
+--- a/cmd/mcpproxyd/main.go
++++ b/cmd/mcpproxyd/main.go
+@@ -9,6 +9,7 @@ package main
+ 
+ import (
+ 	"context"
++	"encoding/json"
+ 	"errors"
+ 	"flag"
+ 	"fmt"
+@@ -134,6 +135,9 @@ func run(cfgPath string, log *slog.Logger) error {
+ 	heldStore := approval.New(cfg.Approvals.Timeout, sink)
+ 
+ 	// ---- pipeline ---------------------------------------------------------
++	if authSrv != nil {
++		authSrv.SetConsent(newConsent(heldStore))
++	}
+ 	hooks := inspect.Hooks{} // standalone: guardrails/redaction via future plugins
+ 	pipeline := checks.Assemble(cfg.Policy, hooks, sink, true)
+ 	if cfg.Optimizer != nil && cfg.Optimizer.TopK > 0 {
+@@ -173,6 +177,11 @@ func run(cfgPath string, log *slog.Logger) error {
+ 		mux.Handle("/token", authSrv.Routes())
+ 		mux.Handle("/register", authSrv.Routes())
+ 		mux.Handle("/callback", authSrv.Routes())
++		mux.HandleFunc("/.well-known/oauth-protected-resource", func(w http.ResponseWriter, _ *http.Request) {
++			w.Header().Set("Content-Type", "application/json")
++			_ = json.NewEncoder(w).Encode(map[string]any{
++				"resource": authSrv.Issuer() + "/mcp", "authorization_servers": []string{authSrv.Issuer()}})
++		})
+ 	} else if cfg.Inbound.Mode == "oidc" {
+ 		// Serve RFC 9728 protected-resource metadata pointing at the
+ 		// external issuer, so MCP clients can discover where to
+@@ -209,11 +218,25 @@ func run(cfgPath string, log *slog.Logger) error {
+ // own tokens; otherwise the configured inbound mode decides.
+ func buildResolver(cfg *config.Config, authSrv *authserver.Server) (gateway.IdentityResolver, error) {
+ 	if authSrv != nil {
++		// Local patch: static tokens (local clients) keep working next to OAuth.
++		var staticRes gateway.IdentityResolver
++		if cfg.Inbound.Mode == "static" {
++			sr, err := inbound.New(cfg.Inbound)
++			if err != nil {
++				return nil, err
++			}
++			staticRes = sr
++		}
+ 		return func(r *http.Request) (inspect.Identity, error) {
+ 			tok := bearerToken(r)
+ 			if tok == "" {
+ 				return inspect.Identity{}, fmt.Errorf("missing bearer token")
+ 			}
++			if staticRes != nil {
++				if id, err := staticRes(r); err == nil {
++					return id, nil
++				}
++			}
+ 			return authSrv.ValidateToken(r.Context(), tok)
+ 		}, nil
+ 	}
+diff --git a/config/config.go b/config/config.go
+index 421ef69..956ae7c 100644
+--- a/config/config.go
++++ b/config/config.go
+@@ -49,6 +49,11 @@ type Inbound struct {
+ 	// Static bearer token (mode=static). Env expansion applies.
+ 	Token string `yaml:"token,omitempty"`
+ 
++	// Tokens (local patch): named per-client bearer tokens (mode=static).
++	// A caller presenting tokens[name] gets Subject "client:<name>", so audit,
++	// approvals and trust are per client and one client is revocable alone.
++	Tokens map[string]string `yaml:"tokens,omitempty"`
++
+ 	// OIDC settings (mode=oidc).
+ 	Issuer   string   `yaml:"issuer,omitempty"`
+ 	Audience string   `yaml:"audience,omitempty"`
+@@ -107,6 +112,27 @@ type Policy struct {
+ 	// ApprovalTools require human approval before execution (globs).
+ 	ApprovalTools []string `yaml:"approval_tools,omitempty"`
+ 
++	// CommandGuardBin / CommandGuardTools (local patch): run the shell command
++	// argument of matching tool calls ("backend/tool" globs) through a
++	// destructive-command guard (dcg hook protocol) and deny on a match.
++	CommandGuardBin   string   `yaml:"command_guard_bin,omitempty"`
++	CommandGuardTools []string `yaml:"command_guard_tools,omitempty"`
++
++	// ApprovalSubjects (local patch): when set, approval_tools only apply to
++	// callers whose subject matches one of these globs (e.g. "oauth:*").
++	// Unset = applies to everyone. An empty subject is always gated.
++	ApprovalSubjects []string `yaml:"approval_subjects,omitempty"`
++
++	// SessionApproval (local patch): hold every session at its first real
++	// request until a human approves it. SessionTTL bounds one approval
++	// (default 1h); after it the session is held again.
++	SessionApproval bool          `yaml:"session_approval,omitempty"`
++	SessionTTL      time.Duration `yaml:"session_ttl,omitempty"`
++	// SessionTrustFile (local patch): JSON map subject -> {trusted_at, expires?}.
++	// A subject listed here skips the session prompt until removed/expired.
++	// Written by the approver on "Trust this client"; re-read when it changes.
++	SessionTrustFile string `yaml:"session_trust_file,omitempty"`
++
+ 	// BlockSampling / BlockElicitation gate server-initiated requests.
+ 	// Default true (deny). nil means unset and resolves to true.
+ 	BlockSampling    *bool `yaml:"block_sampling,omitempty"`
+@@ -156,6 +182,9 @@ type AuthServer struct {
+ 	SigningKeyFile string `yaml:"signing_key_file,omitempty"`
+ 	// AccessTokenTTL default 1h.
+ 	AccessTokenTTL time.Duration `yaml:"access_token_ttl,omitempty"`
++	// ClientsFile (local patch) persists dynamically registered clients so
++	// their client_ids survive restarts.
++	ClientsFile string `yaml:"clients_file,omitempty"`
+ }
+ 
+ // Optimizer configures semantic tool filtering.
+@@ -216,7 +245,7 @@ func (c *Config) Validate() error {
+ 	if c.Inbound.Mode == "oidc" && c.Inbound.Issuer == "" {
+ 		return fmt.Errorf("inbound oidc requires issuer")
+ 	}
+-	if c.Inbound.Mode == "static" && c.Inbound.Token == "" {
++	if c.Inbound.Mode == "static" && c.Inbound.Token == "" && len(c.Inbound.Tokens) == 0 {
+ 		return fmt.Errorf("inbound static requires token")
+ 	}
+ 	if c.Approvals.Timeout == 0 {
+diff --git a/gateway/conn.go b/gateway/conn.go
+index 3287427..0df5290 100644
+--- a/gateway/conn.go
++++ b/gateway/conn.go
+@@ -1,6 +1,7 @@
+ package gateway
+ 
+ import (
++	"os"
+ 	"context"
+ 	"encoding/json"
+ 	"fmt"
+@@ -451,7 +452,15 @@ func (c *conn) fanoutInitialize(ctx context.Context, env *jsonrpc.Message) (*jso
+ 	if c.g.aggregated() && first != nil {
+ 		var res mcp.InitializeResult
+ 		if err := json.Unmarshal(first.Result, &res); err == nil {
+-			res.ServerInfo = mcp.Implementation{Name: "mcpproxy-gateway", Version: "0.1.0"}
++			name := "mcpproxy-gateway"
++			if n := os.Getenv("MCP_SERVER_NAME"); n != "" {
++				name = n
++			}
++			res.ServerInfo = mcp.Implementation{Name: name, Version: "0.1.0"}
++			if lbl := os.Getenv("MCP_LABEL"); lbl != "" {
++				res.Instructions = "This gateway controls ONE specific computer: " + lbl +
++					". Every tool here runs on " + lbl + " and nowhere else. If the user asked for a different computer, do not use these tools."
++			}
+ 			if b, err := json.Marshal(res); err == nil {
+ 				first.Result = b
+ 			}
+diff --git a/gateway/http.go b/gateway/http.go
+index cab3417..e515199 100644
+--- a/gateway/http.go
++++ b/gateway/http.go
+@@ -6,9 +6,12 @@ import (
+ 	"fmt"
+ 	"io"
+ 	"net/http"
++	"os"
++	"strings"
+ 	"time"
+ 
+ 	"github.com/hoophq/mcpproxy/audit"
++	"github.com/hoophq/mcpproxy/checks"
+ 	"github.com/hoophq/mcpproxy/inspect"
+ 	"github.com/hoophq/mcpproxy/jsonrpc"
+ 	"github.com/hoophq/mcpproxy/mcp"
+@@ -37,7 +40,11 @@ func (g *Gateway) resolveIdentity(r *http.Request) (inspect.Identity, error) {
+ func (g *Gateway) serveMCP(w http.ResponseWriter, r *http.Request) {
+ 	identity, err := g.resolveIdentity(r)
+ 	if err != nil {
+-		w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token"`)
++		wa := `Bearer error="invalid_token"`
++		if pub := os.Getenv("MCP_PUBLIC_URL"); pub != "" {
++			wa += `, resource_metadata="` + strings.TrimSuffix(pub, "/") + `/.well-known/oauth-protected-resource"`
++		}
++		w.Header().Set("WWW-Authenticate", wa)
+ 		http.Error(w, "unauthorized: "+err.Error(), http.StatusUnauthorized)
+ 		return
+ 	}
+@@ -226,7 +233,13 @@ func (c *conn) handleC2S(ctx context.Context, env *jsonrpc.Message) (*jsonrpc.Me
+ 		}
+ 		return nil, nil
+ 	case inspect.Hold:
+-		resp, err := c.holdForApproval(ctx, m, dec, toolName)
++		var resp *jsonrpc.Message
++		var err error
++		if checks.IsSessionGateRule(dec.Rule) {
++			resp, err = c.holdSessionGate(ctx, m, dec, toolName)
++		} else {
++			resp, err = c.holdForApproval(ctx, m, dec, toolName)
++		}
+ 		if resp != nil || err != nil {
+ 			return resp, err
+ 		}
+@@ -416,3 +429,27 @@ func writeJSON(w http.ResponseWriter, status int, msg *jsonrpc.Message) {
+ 	w.WriteHeader(status)
+ 	_, _ = w.Write(b)
+ }
++
++// holdSessionGate runs the session-level approval (local patch). One prompt
++// per session at a time: concurrent requests wait on the same decision.
++func (c *conn) holdSessionGate(ctx context.Context, m *inspect.Msg, dec inspect.Decision, tool string) (*jsonrpc.Message, error) {
++	st := checks.GateOf(c.state)
++	st.Lock()
++	defer st.Unlock()
++	if st.Approved() {
++		return nil, nil
++	}
++	if st.Denied() {
++		return jsonrpc.NewError(m.Env.ID, jsonrpc.CodePolicyDenied, "session access was denied"), nil
++	}
++	resp, err := c.holdForApproval(ctx, m, dec, tool)
++	if err != nil {
++		return nil, err
++	}
++	if resp != nil { // rejected or timed out
++		st.Deny(30 * time.Second)
++		return resp, nil
++	}
++	st.Approve()
++	return nil, nil
++}

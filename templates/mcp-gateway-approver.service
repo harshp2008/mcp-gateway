@@ -1,0 +1,15 @@
+[Unit]
+Description=MCP gateway approval popups (needs the desktop session)
+After=graphical-session.target mcp-gateway.service
+PartOf=graphical-session.target
+
+[Service]
+WorkingDirectory=@HOME@
+Environment=MCPGW_HOME=@HOME@
+EnvironmentFile=@HOME@/gateway.env
+ExecStart=/usr/bin/python3 -I @HOME@/approver.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

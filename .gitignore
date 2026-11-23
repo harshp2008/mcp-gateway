@@ -1,0 +1,8 @@
+gateway.env
+*.pem
+trusted.json
+oauth-clients.json
+settings.json
+sessions/
+*.log
+__pycache__/

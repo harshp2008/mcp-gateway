@@ -1,0 +1,15 @@
+[Unit]
+Description=Shared MCP gateway (patched mcpproxy: OAuth + PC-approval + dcg filter)
+After=network.target
+
+[Service]
+WorkingDirectory=@HOME@
+EnvironmentFile=@HOME@/gateway.env
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=@HOME@/bin/mcpproxyd -config @HOME@/config.yaml
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target
