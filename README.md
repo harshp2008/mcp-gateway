@@ -13,11 +13,14 @@ One OAuth-protected MCP endpoint on your PC that fronts all your MCP servers (te
 git clone https://github.com/harshp2008/mcp-gateway && cd mcp-gateway
 ./install.sh                      # name = this PC's hostname
 ./install.sh --name main-laptop   # or pick one
+./install.sh --yes                # no questions (closes and reopens Claude Desktop without asking!)
 ```
 
 Needs: `git python3 curl tar systemd(--user)`, `zenity` for popups. Go is downloaded privately if missing. No root. Installs to `~/.mcp-gateway`, runs as two user services (`mcp-gateway`, `mcp-gateway-approver`), CLI at `~/.local/bin/mcp-gateway`.
 
-It auto-adds backends it finds (`open-terminal`, `figcraft-cli`). Add anything else:
+The installer, in order: installs `open-terminal` if missing, adds `figcraft` if present, then **wires Claude Desktop**: it imports every MCP server already in your Desktop config into the gateway, asks whether to move the now-duplicate entries out of Desktop (reversible, kept under `_disabledMcpServers`), asks before closing Desktop (check no chat/task is running), writes the config (backup kept), and reopens it. Finally it offers to set up Tailscale Funnel. Re-run any step later: `mcp-gateway desktop`, `mcp-gateway funnel`.
+
+Add anything else:
 
 ```bash
 mcp-gateway backend add whatsapp -- uv --directory ~/whatsapp-mcp/whatsapp-mcp-server run main.py
@@ -60,7 +63,7 @@ claude mcp add --transport http mcp-main-laptop http://127.0.0.1:8765/mcp --head
 ```
 
 ### Gemini web (or any web app / phone)
-Web apps need a public HTTPS URL. With Tailscale Funnel (only expose the MCP paths, on a non-443 port so you don't expose other things):
+Web apps need a public HTTPS URL. `mcp-gateway funnel` does all of this for you (needs Tailscale installed and logged in: `curl -fsSL https://tailscale.com/install.sh | sh && sudo tailscale up`; if it complains, enable MagicDNS + HTTPS + Funnel in the Tailscale admin console - it prints the link). Every PC gets its own `<hostname>.<tailnet>.ts.net` name, so two laptops never clash, whether or not they share a Tailscale account. The manual equivalent: With Tailscale Funnel (only expose the MCP paths, on a non-443 port so you don't expose other things):
 ```bash
 for p in /mcp /token /register /authorize /.well-known; do
   tailscale funnel --bg --https=10000 --set-path=$p http://127.0.0.1:8765$p

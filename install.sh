@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Installs the MCP gateway for the current user (no root needed).
-#   ./install.sh [--name NAME] [--url https://host.tailnet.ts.net:10000] [--no-backends]
+#   ./install.sh [--name NAME] [--yes] [--no-desktop] [--no-funnel] [--no-open-terminal] [--no-backends]
 # NAME defaults to this PC's hostname.
 set -euo pipefail
 
@@ -9,12 +9,16 @@ HOME_DIR="${MCPGW_HOME:-$HOME/.mcp-gateway}"
 UPSTREAM=https://github.com/hoophq/mcpproxy
 UPSTREAM_COMMIT=5566d29d02165158a57164ff8c3c23dd895355cc
 DCG_VERSION=v0.17.0
-NAME=""; URL=""; BACKENDS=1
+NAME=""; URL=""; BACKENDS=1; YES=0; DESKTOP=1; FUNNEL=1; OPENTERM=1
 while [ $# -gt 0 ]; do
   case "$1" in
     --name) NAME="$2"; shift 2;;
     --url) URL="$2"; shift 2;;
     --no-backends) BACKENDS=0; shift;;
+    --yes|-y) YES=1; shift;;
+    --no-desktop) DESKTOP=0; shift;;
+    --no-funnel) FUNNEL=0; shift;;
+    --no-open-terminal) OPENTERM=0; shift;;
     -h|--help) sed -n 2,4p "$0"; exit 0;;
     *) echo "unknown option $1"; exit 1;;
   esac
@@ -107,6 +111,14 @@ if n: s["name"]=n
 if u: s["public_url"]=u.rstrip("/")
 json.dump(s,open(p,"w"),indent=2)
 PY
+# open-terminal = the shell/files MCP server; install it if missing
+if [ "$BACKENDS" = 1 ] && [ "$OPENTERM" = 1 ] && ! command -v open-terminal >/dev/null 2>&1; then
+  say "Installing open-terminal"
+  if command -v uv >/dev/null 2>&1; then uv tool install open-terminal
+  elif command -v pipx >/dev/null 2>&1; then pipx install open-terminal
+  else python3 -m pip install --user --break-system-packages open-terminal; fi || echo "open-terminal install failed; install it manually and run: mcp-gateway backend add terminal"
+  export PATH="$HOME/.local/bin:$PATH"
+fi
 if [ "$BACKENDS" = 1 ]; then
   command -v open-terminal >/dev/null && "$CLI" backend add terminal >/dev/null && echo "backend: terminal (open-terminal found)" || echo "skip terminal (open-terminal not installed: pip install open-terminal)"
   command -v figcraft-cli >/dev/null && "$CLI" backend add figcraft >/dev/null && echo "backend: figcraft" || true
@@ -116,6 +128,27 @@ fi
 systemctl --user daemon-reload
 systemctl --user enable --now mcp-gateway.service
 systemctl --user enable --now mcp-gateway-approver.service 2>/dev/null || echo "(approver starts with your desktop session)"
+
+ask() { # ask "question" -> 0 for yes
+  [ "$YES" = 1 ] && return 0
+  [ -r /dev/tty ] || return 1
+  printf '%s [y/N] ' "$1" > /dev/tty; read -r a < /dev/tty; case "$a" in y|Y|yes) return 0;; *) return 1;; esac
+}
+YF=""; [ "$YES" = 1 ] && YF="--yes"
+
+if [ "$DESKTOP" = 1 ]; then
+  say "Claude Desktop"
+  "$CLI" desktop $YF || echo "(skipped; run later: mcp-gateway desktop)"
+fi
+
+if [ "$FUNNEL" = 1 ]; then
+  say "Public access (Tailscale Funnel) - needed for Gemini/web apps, not for Claude Desktop/Code"
+  if command -v tailscale >/dev/null 2>&1; then
+    if ask "Expose this PC through Tailscale Funnel now?"; then "$CLI" funnel || echo "(fix the message above, then run: mcp-gateway funnel)"; fi
+  else
+    echo "Tailscale not installed. Later: curl -fsSL https://tailscale.com/install.sh | sh && sudo tailscale up && mcp-gateway funnel"
+  fi
+fi
 
 say "Done"
 "$CLI" status || true
